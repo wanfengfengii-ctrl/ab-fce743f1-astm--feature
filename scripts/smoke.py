@@ -5,7 +5,8 @@
     python scripts/smoke.py [BASE_URL]
 
 覆盖：健康检查、跨块（每块 1 字节）合法会话且含 NAK 重传、校验失败、
-方向越权、非原样重传、坏 Base64。全部通过则以退出码 0 结束。
+方向越权、非原样重传、坏 Base64，以及 recordAudit=result_set 的默认兼容、
+跨帧结果集成功与语义失败。全部通过则以退出码 0 结束。
 """
 
 from __future__ import annotations
@@ -185,6 +186,113 @@ def main() -> int:
     check(
         "坏 Base64 返回 400（BAD_BASE64）",
         status == 400 and body.get("code") == "BAD_BASE64",
+        f"status={status}, body={body}",
+    )
+
+    # 6) recordAudit 省略：响应结构保持原样（无结果集字段）
+    result_body = (
+        b"H|\\^&|||analyzer^1.0\r"
+        b"P|1||PAT001\r"
+        b"O|1||SAMP01||||\r"
+        b"R|1||GLU||5.0\r"
+        b"R|2||HGB||130\r"
+        b"P|2||PAT002\r"
+        b"O|1||SAMP02||||\r"
+        b"R|1||GLU||6.1\r"
+        b"L|1"
+    )
+
+    def result_events(data: bytes, piece: int = 3) -> list:
+        evts = [
+            ("sender", bytes([ENQ])),
+            ("receiver", bytes([ACK])),
+        ]
+        frame_no = 1
+        first = True
+        for i in range(0, len(data), piece):
+            frame = make_frame(frame_no, data[i : i + piece])
+            evts.append(("sender", frame))
+            if first:
+                # 首帧经历一次 NAK 原样重传
+                evts.append(("receiver", bytes([NAK])))
+                evts.append(("sender", frame))
+            evts.append(("receiver", bytes([ACK])))
+            first = False
+            frame_no = 1 if frame_no == 0 else (frame_no + 1 if frame_no < 7 else 0)
+        evts.append(("sender", bytes([EOT])))
+        return evts
+
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {"sender": "analyzer-A", "chunks": to_chunks(result_events(result_body), piece=1)},
+    )
+    old_keys = {"ok", "sender", "payload", "payload_bytes", "frame_count", "retransmissions", "sha256"}
+    check(
+        "省略 recordAudit 时响应与旧版完全兼容",
+        status == 200 and set(body.keys()) == old_keys,
+        f"status={status}, keys={set(body.keys()) if isinstance(body, dict) else body}",
+    )
+
+    # 7) recordAudit=result_set：跨帧记录（3 字节/帧）+ 重传，返回计数与标识
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "recordAudit": "result_set",
+            "chunks": to_chunks(result_events(result_body), piece=1),
+        },
+    )
+    ok = (
+        status == 200
+        and body.get("patient_count") == 2
+        and body.get("order_count") == 2
+        and body.get("result_count") == 3
+        and body.get("patient_ids") == ["PAT001", "PAT002"]
+        and body.get("sample_ids") == ["SAMP01", "SAMP02"]
+        and body.get("result_counts") == [2, 1]
+        and body.get("retransmissions") == 1
+    )
+    check("结果集复核成功（跨帧 + 重传）返回计数与标识", ok, f"status={status}, body={body}")
+
+    # 8) recordAudit=result_set：语义失败（同患者重复样本号）→ 422 稳定错误码
+    dup_body = (
+        b"H|\\^&\rP|1||P1\r"
+        b"O|1||S1\rR|1||T1||1\r"
+        b"O|2||S1\rR|1||T2||2\rL|1"
+    )
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "recordAudit": "result_set",
+            "chunks": to_chunks(result_events(dup_body, piece=2), piece=1),
+        },
+    )
+    check(
+        "结果集语义失败返回 422（DUPLICATE_SAMPLE_ID）并定位块",
+        status == 422
+        and body.get("code") == "DUPLICATE_SAMPLE_ID"
+        and isinstance(body.get("block_index"), int)
+        and isinstance(body.get("position"), int),
+        f"status={status}, body={body}",
+    )
+
+    # 9) 非法 recordAudit 取值 → 400
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "recordAudit": "full",
+            "chunks": to_chunks(result_events(result_body), piece=1),
+        },
+    )
+    check(
+        "非法 recordAudit 取值返回 400（INVALID_REQUEST）",
+        status == 400 and body.get("code") == "INVALID_REQUEST",
         f"status={status}, body={body}",
     )
 

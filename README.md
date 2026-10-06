@@ -53,6 +53,55 @@ STX FN PAYLOAD (ETB|ETX) HEX HEX CR LF
 }
 ```
 
+#### 可选：结果归属复核（`recordAudit=result_set`）
+
+请求中加入 `"recordAudit": "result_set"` 后，服务在传输复核通过之外，
+再校验重组正文确实构成归属明确的结果集（省略该字段时请求、响应与错误
+语义与旧版完全一致）。重组正文必须：
+
+- 全部为 ASCII 可打印字符，记录之间以单个 `CR` 分隔且记录非空；
+- 首条为 `H`、末条为 `L`，中间按 `P`（患者）→ `O`（医嘱）→ `R`（结果）
+  形成层级：每个患者至少一个医嘱，每个医嘱至少一个结果；
+- 字段分隔符由首条 `H` 记录开头声明的**四个互异可打印字符**确定
+  （`H` 后依次为字段、重复、分量、转义分隔符，惯例为 `H|\^&`）；
+- `P-1`/`O-1`/`R-1` 在各自作用域内从 `1` 连续递增（医嘱序号在患者作用域、
+  结果序号在医嘱作用域内计数）；
+- `P-3` 患者号、`O-3` 样本号、`R-3` 检验号非空；同一患者内样本号不得重复
+  （不同患者允许相同样本号）。
+
+成功时在原响应基础上增加计数与按正文顺序排列的标识：
+
+```json
+{
+  "ok": true,
+  "sender": "analyzer-A",
+  "payload": "…",
+  "patient_count": 2,
+  "order_count": 2,
+  "result_count": 3,
+  "patient_ids": ["PAT001", "PAT002"],
+  "sample_ids": ["SAMP01", "SAMP02"],
+  "result_counts": [2, 1],
+  "frame_count": 5,
+  "retransmissions": 1,
+  "sha256": "…"
+}
+```
+
+结果集违例同样返回 `422`，错误码稳定，位置指向**首个相关正文字节**
+所在的原始（非重传）块：
+
+| 代码 | 含义 |
+| --- | --- |
+| `NON_ASCII_BODY` | 重组正文含非 ASCII（或不可打印）字节 |
+| `INVALID_DELIMITER` | H 未声明四个互异可打印分隔符，或声明格式非法 |
+| `RECORD_ORDER` | H/L 位置错误、记录为空或层级失序（含缺医嘱/缺结果） |
+| `SEQUENCE_SKIP` | P-1/O-1/R-1 缺失、非正整数或未在作用域内连续递增 |
+| `MISSING_IDENTIFIER` | P-3、O-3 或 R-3 标识为空 |
+| `DUPLICATE_SAMPLE_ID` | 同一患者内样本号重复 |
+
+非法 `recordAudit` 取值返回 `400 INVALID_REQUEST`。
+
 协议违例返回 `422`，错误码稳定，并给出**首个出错块内**的 0 基位置 `position` 及全局偏移 `global_offset`：
 
 ```json

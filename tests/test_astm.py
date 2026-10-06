@@ -325,9 +325,260 @@ def test_cr_allowed_inside_payload():
     assert result["sha256"] == hashlib.sha256(payload).hexdigest()
 
 
+# ---- 结果集复核（recordAudit=result_set）----------------------------------
+
+RESULT_BODY = (
+    b"H|\\^&|||analyzer^1.0\r"
+    b"P|1||PAT001\r"
+    b"O|1||SAMP01||||\r"
+    b"R|1||GLU||5.0\r"
+    b"R|2||HGB||130\r"
+    b"P|2||PAT002\r"
+    b"O|1||SAMP02||||\r"
+    b"R|1||GLU||6.1\r"
+    b"L|1"
+)
+
+
+def result_events(body: bytes, piece: int = 50, retransmit_first: bool = False):
+    """把结果集正文按 piece 大小切成多帧，构造完整会话。"""
+    events = [("sender", bytes([ENQ])), ("receiver", bytes([ACK]))]
+    fn = 1
+    first = True
+    for i in range(0, len(body), piece):
+        frame = make_frame(fn, body[i : i + piece], terminator=ETB)
+        events.append(("sender", frame))
+        if first and retransmit_first:
+            events.append(("receiver", bytes([NAK])))
+            events.append(("sender", frame))
+        events.append(("receiver", bytes([ACK])))
+        first = False
+        fn = 1 if fn == 0 else (fn + 1 if fn < 7 else 0)
+    events.append(("sender", bytes([EOT])))
+    return events
+
+
+def expect_result_violation(body_or_events, code):
+    events = (
+        body_or_events
+        if isinstance(body_or_events, list)
+        else result_events(body_or_events)
+    )
+    with pytest.raises(ProtocolViolation) as exc:
+        audit("x", events, "result_set")
+    assert exc.value.code == code, exc.value.message
+    return exc.value
+
+
+def test_result_audit_default_omitted_keeps_old_shape():
+    result = audit("x", result_events(RESULT_BODY))
+    assert set(result) == {
+        "ok",
+        "sender",
+        "payload",
+        "payload_bytes",
+        "frame_count",
+        "retransmissions",
+        "sha256",
+    }
+
+
+def test_result_audit_counts_and_ordering():
+    result = audit("x", result_events(RESULT_BODY, piece=7), "result_set")
+    assert result["patient_count"] == 2
+    assert result["order_count"] == 2
+    assert result["result_count"] == 3
+    assert result["patient_ids"] == ["PAT001", "PAT002"]
+    assert result["sample_ids"] == ["SAMP01", "SAMP02"]
+    assert result["result_counts"] == [2, 1]
+    # 原传输字段保持不变
+    assert result["frame_count"] == -(-len(RESULT_BODY) // 7)  # ceil 向上取整
+
+
+def test_result_audit_cross_frame_records_with_retransmission():
+    # 每帧 3 字节：所有记录都跨帧；首帧还经历一次 NAK 重传
+    events = result_events(RESULT_BODY, piece=3, retransmit_first=True)
+    result = audit("x", events, "result_set")
+    assert result["patient_count"] == 2
+    assert result["order_count"] == 2
+    assert result["result_count"] == 3
+    assert result["patient_ids"] == ["PAT001", "PAT002"]
+    assert result["sample_ids"] == ["SAMP01", "SAMP02"]
+    assert result["result_counts"] == [2, 1]
+    # 重传不影响帧计数
+    assert result["frame_count"] == -(-len(RESULT_BODY) // 3)
+    assert result["retransmissions"] == 1
+
+
+def test_result_audit_minimal_valid_set():
+    body = b"H|\\^&\rP|1||P1\rO|1||S1||||\rR|1||T1||1\rL|1"
+    result = audit("x", result_events(body, piece=4), "result_set")
+    assert result["patient_count"] == 1
+    assert result["order_count"] == 1
+    assert result["result_count"] == 1
+    assert result["result_counts"] == [1]
+
+
+def test_result_audit_non_ascii_rejected():
+    bad = b"GL\xff"
+    body = RESULT_BODY.replace(b"GLU", bad)
+    events = result_events(body, piece=50)
+    exc = expect_result_violation(events, "NON_ASCII_BODY")
+    # 位置指向出错的 sender 帧块，且块内该字节就是 0xFF
+    direction, raw = events[exc.block_index]
+    assert direction == "sender"
+    assert raw[exc.position] == 0xFF
+    # 默认模式（省略 recordAudit）同一字节仍走旧的 INVALID_BODY
+    with pytest.raises(ProtocolViolation) as default_exc:
+        audit("x", events)
+    assert default_exc.value.code == "INVALID_BODY"
+
+
+def test_result_audit_invalid_delimiters():
+    # 少于四个分隔符
+    expect_result_violation(
+        b"H|\\^\rP|1||P1\rO|1||S1\rR|1||T1\rL|1", "INVALID_DELIMITER"
+    )
+    # 分隔符重复
+    expect_result_violation(
+        b"H|\\|\\\rP|1||P1\rO|1||S1\rR|1||T1\rL|1", "INVALID_DELIMITER"
+    )
+
+
+def test_result_audit_custom_field_delimiter():
+    body = b"H:\\^&\rP:1::P1\rO:1::S1::::\rR:1::T1::1\rL:1"
+    result = audit("x", result_events(body, piece=5), "result_set")
+    assert result["patient_ids"] == ["P1"]
+    assert result["sample_ids"] == ["S1"]
+    assert result["result_counts"] == [1]
+
+
+def test_result_audit_hierarchy():
+    # H 不是首条
+    expect_result_violation(b"P|1||P1\rH|\\^&\rL|1", "RECORD_ORDER")
+    # L 不是末条
+    expect_result_violation(
+        b"H|\\^&\rP|1||P1\rO|1||S1\rR|1||T1||1\rP|2||P2", "RECORD_ORDER"
+    )
+    # O 没有上级 P
+    expect_result_violation(
+        b"H|\\^&\rO|1||S1\rR|1||T1||1\rL|1", "RECORD_ORDER"
+    )
+    # R 没有上级 O
+    expect_result_violation(
+        b"H|\\^&\rP|1||P1\rR|1||T1||1\rO|1||S1\rL|1", "RECORD_ORDER"
+    )
+    # 患者缺医嘱
+    expect_result_violation(
+        b"H|\\^&\rP|1||P1\rL|1", "RECORD_ORDER"
+    )
+    # 医嘱缺结果（收尾）
+    expect_result_violation(
+        b"H|\\^&\rP|1||P1\rO|1||S1\rL|1", "RECORD_ORDER"
+    )
+    # 医嘱缺结果（下一个患者出现）
+    expect_result_violation(
+        b"H|\\^&\rP|1||P1\rO|1||S1\rP|2||P2\rO|1||S2\rR|1||T1||1\rL|1",
+        "RECORD_ORDER",
+    )
+    # 空记录（连续 CR）
+    expect_result_violation(
+        b"H|\\^&\r\rP|1||P1\rO|1||S1\rR|1||T1||1\rL|1", "RECORD_ORDER"
+    )
+    # 未知记录类型
+    expect_result_violation(
+        b"H|\\^&\rX|1\rL|1", "RECORD_ORDER"
+    )
+
+
+def test_result_audit_sequence_skips():
+    expect_result_violation(
+        b"H|\\^&\rP|2||P1\rO|1||S1\rR|1||T1||1\rL|1", "SEQUENCE_SKIP"
+    )
+    expect_result_violation(
+        b"H|\\^&\rP|1||P1\rO|2||S1\rR|1||T1||1\rL|1", "SEQUENCE_SKIP"
+    )
+    expect_result_violation(
+        b"H|\\^&\rP|1||P1\rO|1||S1\rR|2||T1||1\rL|1", "SEQUENCE_SKIP"
+    )
+    # 序号在新作用域内重新从 1 开始：合法
+    body = (
+        b"H|\\^&\rP|1||P1\rO|1||S1\rR|1||A||1\rR|2||B||2\r"
+        b"O|2||S2\rR|1||C||3\r"
+        b"P|2||P2\rO|1||S3\rR|1||D||4\rL|1"
+    )
+    result = audit("x", result_events(body, piece=6), "result_set")
+    assert result["result_counts"] == [2, 1, 1]
+
+
+def test_result_audit_missing_identifiers():
+    expect_result_violation(
+        b"H|\\^&\rP|1||\rO|1||S1\rR|1||T1||1\rL|1", "MISSING_IDENTIFIER"
+    )
+    expect_result_violation(
+        b"H|\\^&\rP|1||P1\rO|1||\rR|1||T1||1\rL|1", "MISSING_IDENTIFIER"
+    )
+    expect_result_violation(
+        b"H|\\^&\rP|1||P1\rO|1||S1\rR|1||\rL|1", "MISSING_IDENTIFIER"
+    )
+
+
+def test_result_audit_duplicate_sample_within_patient():
+    body = (
+        b"H|\\^&\rP|1||P1\r"
+        b"O|1||S1\rR|1||T1||1\r"
+        b"O|2||S1\rR|1||T2||2\rL|1"
+    )
+    expect_result_violation(body, "DUPLICATE_SAMPLE_ID")
+
+
+def test_result_audit_same_sample_id_across_patients_allowed():
+    body = (
+        b"H|\\^&\rP|1||P1\rO|1||S1\rR|1||T1||1\r"
+        b"P|2||P2\rO|1||S1\rR|1||T2||2\rL|1"
+    )
+    result = audit("x", result_events(body, piece=5), "result_set")
+    assert result["sample_ids"] == ["S1", "S1"]
+
+
+def test_result_audit_position_points_to_original_non_retransmitted_block():
+    # 缺陷位于首帧（分隔符重复），首帧经历一次 NAK 重传；
+    # 报错块必须是首个（原始）发送块，而不是重传块。
+    f1 = make_frame(1, b"H|\\|\\\r")
+    f2 = make_frame(2, b"P|1||P1\rO|1||S1\rR|1||T1||1\rL|1", terminator=ETX)
+    events = [
+        ("sender", bytes([ENQ])),
+        ("receiver", bytes([ACK])),
+        ("sender", f1),                      # 块 2：原始传输
+        ("receiver", bytes([NAK])),          # 块 3
+        ("sender", f1),                      # 块 4：重传
+        ("receiver", bytes([ACK])),          # 块 5
+        ("sender", f2),
+        ("receiver", bytes([ACK])),
+        ("sender", bytes([EOT])),
+    ]
+    exc = expect_result_violation(events, "INVALID_DELIMITER")
+    assert exc.block_index == 2
+    # 位置落在原始帧的正文字节上（STX+帧号之后）
+    assert 2 <= exc.position < len(f1) - 5
+
+
+def test_result_audit_position_maps_into_cross_frame_byte():
+    # 跨帧（每帧 4 字节）时，重复样本号在第二患者段；块/位置应命中 'S1'
+    body = (
+        b"H|\\^&\rP|1||P1\rO|1||S1\rR|1||T1||1\r"
+        b"O|2||S1\rR|1||T2||2\rL|1"
+    )
+    events = result_events(body, piece=4)
+    exc = expect_result_violation(events, "DUPLICATE_SAMPLE_ID")
+    direction, raw = events[exc.block_index]
+    assert direction == "sender"
+    assert chr(raw[exc.position]) == "S"
+
+
 # ---- 请求解析与 HTTP 层 ----------------------------------------------------
 
-def _post(events, piece=None, sender="analyzer-A"):
+def _post(events, piece=None, sender="analyzer-A", record_audit=None):
     decoded = chunks_for(events, piece) if piece else events
     body = {
         "sender": sender,
@@ -336,6 +587,8 @@ def _post(events, piece=None, sender="analyzer-A"):
             for d, raw in decoded
         ],
     }
+    if record_audit is not None:
+        body["recordAudit"] = record_audit
     return client.post("/api/astm/sessions/audit", json=body)
 
 
@@ -352,6 +605,52 @@ def test_api_valid_cross_chunk_with_retransmission():
     assert data["frame_count"] == 2
     assert data["retransmissions"] == 1
     assert data["sha256"] == hashlib.sha256(EXPECTED_PAYLOAD).hexdigest()
+
+
+def test_api_default_response_unchanged_when_record_audit_absent():
+    resp = _post(result_events(RESULT_BODY, piece=3))
+    assert resp.status_code == 200, resp.text
+    assert set(resp.json()) == {
+        "ok",
+        "sender",
+        "payload",
+        "payload_bytes",
+        "frame_count",
+        "retransmissions",
+        "sha256",
+    }
+
+
+def test_api_result_set_audit_success():
+    resp = _post(result_events(RESULT_BODY, piece=3, retransmit_first=True), record_audit="result_set")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["patient_count"] == 2
+    assert data["order_count"] == 2
+    assert data["result_count"] == 3
+    assert data["patient_ids"] == ["PAT001", "PAT002"]
+    assert data["sample_ids"] == ["SAMP01", "SAMP02"]
+    assert data["result_counts"] == [2, 1]
+
+
+def test_api_result_set_audit_semantic_failure_is_422():
+    bad = RESULT_BODY.replace(b"GLU", b"GL\xff")
+    resp = _post(result_events(bad, piece=3), record_audit="result_set")
+    assert resp.status_code == 422
+    err = resp.json()
+    assert err["code"] == "NON_ASCII_BODY"
+    assert isinstance(err["block_index"], int)
+    assert isinstance(err["position"], int)
+    assert isinstance(err["global_offset"], int)
+
+
+def test_api_invalid_record_audit_value_is_400():
+    resp = _post(
+        result_events(RESULT_BODY),
+        record_audit="full",
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "INVALID_REQUEST"
 
 
 def test_api_violation_reports_block_and_position():
