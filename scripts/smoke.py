@@ -72,6 +72,31 @@ def to_chunks(events, piece: int = 1) -> list[dict]:
     return chunks
 
 
+def result_set_events(payload: bytes, fsize: int = 240, nak_frames=()) -> list:
+    """把结果集正文按 fsize 切成多帧会话（帧边界可落在记录/字段任意位置）。"""
+    pieces = [payload[i : i + fsize] for i in range(0, len(payload), fsize)]
+    events = [("sender", bytes([ENQ])), ("receiver", bytes([ACK]))]
+    for i, piece in enumerate(pieces):
+        fn_num = (i % 8) + 1  # 1..8，其中 8 对应循环帧号 0
+        if fn_num == 8:
+            fn_num = 0
+        term = ETB if i < len(pieces) - 1 else ETX
+        frame = make_frame(fn_num, piece, terminator=term)
+        events.append(("sender", frame))
+        if i in nak_frames:
+            events.extend(
+                [
+                    ("receiver", bytes([NAK])),
+                    ("sender", frame),  # 原样重传
+                    ("receiver", bytes([ACK])),
+                ]
+            )
+        else:
+            events.append(("receiver", bytes([ACK])))
+    events.append(("sender", bytes([EOT])))
+    return events
+
+
 RESULTS: list[tuple[str, bool, str]] = []
 
 
@@ -185,6 +210,85 @@ def main() -> int:
     check(
         "坏 Base64 返回 400（BAD_BASE64）",
         status == 400 and body.get("code") == "BAD_BASE64",
+        f"status={status}, body={body}",
+    )
+
+    # 6) recordAudit=result_set：默认省略时响应语义不变
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {"sender": "analyzer-A", "chunks": to_chunks(events, piece=1)},
+    )
+    check(
+        "省略 recordAudit 时响应不含结果集字段（默认兼容）",
+        status == 200 and "patients" not in body and "record_audit" not in body,
+        f"status={status}, body={body}",
+    )
+
+    # 7) recordAudit=result_set：跨帧记录的合法结果集
+    result_set = (
+        b"H|\\^&|||analyzer^1.0\r"
+        b"P|1||P123\r"
+        b"O|1||S1^^^ASTM^M|||\r"
+        b"R|1||^^^GLU^M|5.1\r"
+        b"R|2||^^^NA^M|140\r"
+        b"P|2||P124\r"
+        b"O|1||S2^^^ASTM^M|||\r"
+        b"R|1||^^^K^M|4.0\r"
+        b"L|"
+    )
+    rs_events = result_set_events(result_set, fsize=13)
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "recordAudit": "result_set",
+            "chunks": to_chunks(rs_events, piece=2),
+        },
+    )
+    ok = (
+        status == 200
+        and body.get("record_audit") == "result_set"
+        and (body.get("patients"), body.get("orders"), body.get("results")) == (2, 2, 3)
+        and body.get("patient_ids") == ["P123", "P124"]
+        and body.get("sample_ids") == ["S1^^^ASTM^M", "S2^^^ASTM^M"]
+        and body.get("result_counts") == [2, 1]
+    )
+    check("结果集审计（跨帧记录）返回计数与标识", ok, f"status={status}, body={body}")
+
+    # 8) recordAudit=result_set：语义失败（患者 2 序号跳变）→ 422 稳定错误码
+    bad_rs = result_set.replace(b"P|2||P124", b"P|3||P124")
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "recordAudit": "result_set",
+            "chunks": to_chunks(result_set_events(bad_rs, fsize=11), piece=3),
+        },
+    )
+    ok = (
+        status == 422
+        and body.get("code") == "RESULT_SEQUENCE_SKIP"
+        and isinstance(body.get("block_index"), int)
+        and isinstance(body.get("position"), int)
+    )
+    check("结果集语义失败返回 422 稳定错误码并定位", ok, f"status={status}, body={body}")
+
+    # 9) recordAudit 非法取值 → 400
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "recordAudit": "full",
+            "chunks": [{"direction": "sender", "data": ""}],
+        },
+    )
+    check(
+        "非法 recordAudit 返回 400（INVALID_REQUEST）",
+        status == 400 and body.get("code") == "INVALID_REQUEST",
         f"status={status}, body={body}",
     )
 

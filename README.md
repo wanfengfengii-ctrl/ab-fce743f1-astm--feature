@@ -53,6 +53,63 @@ STX FN PAYLOAD (ETB|ETX) HEX HEX CR LF
 }
 ```
 
+#### 可选：结果集记录复核 `recordAudit=result_set`
+
+传输复核通过只说明“线路完整”，仍可能导入游离结果。请求中加入
+`"recordAudit": "result_set"` 后，服务会在传输复核之外再确认重组正文
+是归属明确的完整结果集：
+
+- 重组正文必须全部为 ASCII（`0x20..0x7E`），并以 `CR` 分隔**非空**记录；
+- `H` 必须为首条、`L` 必须为末条；
+- 中间记录按 `P`（患者）→ `O`（医嘱）→ `R`（结果）形成层级，
+  每个患者至少一个医嘱，每个医嘱至少一个结果；
+- 字段按 `H` 开头声明的四个**互异可打印**分隔符解析（如标准的 `H|\^&`）；
+- `P-1`、`O-1`、`R-1` 在各自作用域内从 `1` 连续递增
+  （`O` 序号按患者重置，`R` 序号按医嘱重置）；
+- `P-3` 患者号、`O-3` 样本号、`R-3` 检验号必须非空；
+- 同一患者内样本号不得重复（不同患者允许相同样本号）。
+
+```json
+{
+  "sender": "analyzer-A",
+  "recordAudit": "result_set",
+  "chunks": [ … ]
+}
+```
+
+成功时在既有字段之外追加：
+
+```json
+{
+  "record_audit": "result_set",
+  "patients": 2,
+  "orders": 2,
+  "results": 3,
+  "patient_ids": ["P123", "P124"],
+  "sample_ids": ["S1^^^ASTM^M", "S2^^^ASTM^M"],
+  "result_counts": [2, 1]
+}
+```
+
+`patient_ids`、`sample_ids` 按正文顺序排列，`result_counts` 为每位患者
+（按正文顺序）的结果数。省略 `recordAudit`（或传 `null`）时，请求、
+响应与错误语义与原先完全一致。
+
+结果集语义违例同样返回 `422`，错误码稳定，`position` 指向首个相关正文
+字节所在的**原始非重传块**（重传副本不产生重组字节，因此不会指向重传块）：
+
+| 代码 | 含义 |
+| --- | --- |
+| `RESULT_NON_ASCII` | 重组正文含非 ASCII 字节 |
+| `RESULT_EMPTY_RECORD` | 存在空记录（首尾 CR 或连续 CR） |
+| `RESULT_INVALID_DELIMITERS` | H 未声明四个互异的可打印分隔符 |
+| `RESULT_HIERARCHY` | H/L 位置或 P→O→R 层级失序（含未知记录、缺患者/医嘱/结果） |
+| `RESULT_SEQUENCE_SKIP` | P-1/O-1/R-1 缺失、非正整数或未在作用域内连续递增 |
+| `RESULT_MISSING_IDENTIFIER` | P-3 患者号、O-3 样本号或 R-3 检验号为空 |
+| `RESULT_DUPLICATE_SAMPLE` | 同一患者内样本号重复 |
+| `RESULT_PATIENT_WITHOUT_ORDER` | 患者下没有任何医嘱 |
+| `RESULT_ORDER_WITHOUT_RESULT` | 医嘱下没有任何结果 |
+
 协议违例返回 `422`，错误码稳定，并给出**首个出错块内**的 0 基位置 `position` 及全局偏移 `global_offset`：
 
 ```json
@@ -98,7 +155,7 @@ ASTM_HOST_PORT=8080 docker compose up --build
 - `api`：常驻 API 服务，带健康检查；
 - `verify`：一次性服务，等 `api` 健康后依次执行
   单元测试（pytest）、构建检查（字节码编译 + 应用导入）、
-  含跨块切分与 NAK 重传的 API 冒烟，以退出码报告结果后自行退出：
+  含跨块切分、NAK 重传与结果集记录审计的 API 冒烟，以退出码报告结果后自行退出：
 
 ```bash
 docker compose up --build verify
